@@ -161,31 +161,28 @@ $('locate').onclick=locateUser;
 // user for permission; if declined, the search fields still work normally.
 setTimeout(locateUser,700);
 
-async function loadNetwork(){
-  $('msg').textContent='Downloading/checking the real Dehradun road network…';
-  const r=await fetch('/api/network');
-  const text=await r.text();
-  let d; try { d=JSON.parse(text); } catch (_) { throw new Error(`Server returned an unexpected response (${r.status}). Please wait a little and refresh the page.`); }
-  if(!r.ok)throw new Error(d.error||'Road network unavailable');
-  $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
-  $('msg').textContent=`API road graph ready: ${d.nodeCount.toLocaleString()} nodes and ${d.edgeCount.toLocaleString()} edges.`;
-}
-
-async function loadNetwork(){
-  $('msg').textContent='Downloading/checking the real Dehradun road network…';
-  const r=await fetch('/api/network');
-  const text=await r.text();
-  let d; try { d=JSON.parse(text); } catch (_) { throw new Error(`Server returned an unexpected response (${r.status}). Please wait a little and refresh the page.`); }
-  if(!r.ok)throw new Error(d.error||'Road network unavailable');
-  $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
-  $('msg').textContent=`API road graph ready: ${d.nodeCount.toLocaleString()} nodes and ${d.edgeCount.toLocaleString()} edges.`;
+async function showNetworkStatus(){
+  try{
+    const r=await fetch('/api/network');
+    const d=await r.json();
+    if(d.ready){
+      $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
+      $('msg').textContent='Road graph cache ready. Select your destination and click Find Optimal Route.';
+    }else{
+      $('msg').textContent='Ready. The road network will be downloaded when you calculate a route.';
+    }
+  }catch(_){
+    $('msg').textContent='Ready. Select source and destination, then calculate the route.';
+  }
 }
 
 async function findRoute(){
   $('msg').textContent='';
   if(!state.source||!state.destination){$('msg').textContent='Select both source and destination on the map.';return;}
+  $('msg').textContent='Downloading road data and calculating the optimal route…';
   const r=await fetch('/api/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:state.source,destination:state.destination})});
-  const d=await r.json();
+  const text=await r.text();
+  let d; try{d=JSON.parse(text);}catch(_){throw new Error(`Server returned an unexpected response (${r.status}). Please wait a little and try again.`);}
   if(!r.ok){$('msg').textContent=d.error||'Unable to calculate route.';return;}
   if(state.routeLayer)state.routeLayer.remove();
   if(!d.found){$('path').textContent='No route found in the generated road graph.';return;}
@@ -205,7 +202,7 @@ $('refresh').onclick=async()=>{
   $('msg').textContent='Refreshing road data from Overpass…';
   try{const r=await fetch('/api/refresh-network',{method:'POST'});const text=await r.text();let d;try{d=JSON.parse(text)}catch(_){throw new Error(`Server returned an unexpected response (${r.status}). Please wait and try again.`)}if(!r.ok)throw new Error(d.error);$('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;$('msg').textContent='Road network refreshed successfully.';}catch(e){$('msg').textContent=e.message;}
 };
-loadNetwork().catch(e=>$('msg').textContent=e.message);
+showNetworkStatus();
 </script>
 </body>
 </html>

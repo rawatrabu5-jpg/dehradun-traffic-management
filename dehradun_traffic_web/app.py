@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import http.client
 import gzip
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
@@ -18,7 +19,7 @@ CACHE_FILE = os.path.join(ROOT, "backend", "dehradun_osm_graph.json")
 CACHE_TTL = 60 * 60 * 6  # refresh the downloaded road network every 6 hours
 
 # Dehradun city-area bounding box: south, west, north, east.
-BBOX = (30.29, 77.91, 30.41, 78.16)
+BBOX = (30.24, 77.90, 30.42, 78.20)
 OVERPASS_URLS = [
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
@@ -119,141 +120,134 @@ def parse_speed(value, highway):
         return default_speed(highway)
 
 
-def fetch_overpass_tile(bbox, endpoint_urls, tile_no):
-    """Fetch one smaller Overpass tile, trying multiple endpoints."""
+def overpass_query(bbox):
+    """Build a compact road-only Overpass query for a bounding box."""
     s, w, n, e = bbox
-    query = f"""[out:json][timeout:35][maxsize:268435456];
-way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|construction|proposed|bridleway|corridor|raceway|service)$\"]({s},{w},{n},{e});
+    return f"""[out:json][timeout:20][maxsize:134217728];
+way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|construction|proposed|bridleway|corridor|raceway)$\"]({s},{w},{n},{e});
 out geom qt;"""
+
+
+def fetch_overpass_endpoint(endpoint, query, timeout=18):
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    headers = {
-        "User-Agent": "DehradunTrafficPBL/4.0 (educational project)",
+    req = urllib.request.Request(endpoint, data=encoded, headers={
+        "User-Agent": "DehradunTrafficPBL/5.0 (educational project)",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "Connection": "close",
-    }
+    }, method="POST")
+    with IPV4_OPENER.open(req, timeout=timeout) as response:
+        raw = response.read()
+        if response.headers.get("Content-Encoding", "").lower() == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw.decode("utf-8"))
+
+
+def fetch_overpass_parallel(bbox):
+    """Race several Overpass mirrors so one slow mirror cannot block the app."""
+    query = overpass_query(bbox)
     errors = []
-    for endpoint in endpoint_urls:
-        req = urllib.request.Request(endpoint, data=encoded, headers=headers, method="POST")
-        try:
-            with IPV4_OPENER.open(req, timeout=45) as response:
-                raw = response.read()
-                if response.headers.get("Content-Encoding", "").lower() == "gzip":
-                    raw = gzip.decompress(raw)
-                data = json.loads(raw.decode("utf-8"))
-            return data
-        except Exception as exc:
-            errors.append(f"{endpoint}: {exc}")
-    raise RuntimeError(f"Overpass tile {tile_no} failed: " + " | ".join(errors))
+    with ThreadPoolExecutor(max_workers=len(OVERPASS_URLS)) as pool:
+        futures = {pool.submit(fetch_overpass_endpoint, url, query): url for url in OVERPASS_URLS}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                data = future.result()
+                if data.get("elements"):
+                    return data
+                errors.append(f"{url}: empty response")
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+    raise RuntimeError("All Overpass servers failed: " + " | ".join(errors))
 
 
-def fetch_osm_graph():
-    """Download the Dehradun road graph in several smaller Overpass tiles.
+def fetch_osm_graph(bbox=None):
+    """Download a route-sized OSM road graph from OpenStreetMap."""
+    if bbox is None:
+        bbox = BBOX
+    try:
+        data = fetch_overpass_parallel(bbox)
+        all_elements = data.get("elements", [])
+    except Exception as first_error:
+        south, west, north, east = bbox
+        lat_mid = (south + north) / 2
+        lon_mid = (west + east) / 2
+        tiles = [
+            (south, west, lat_mid, lon_mid), (south, lon_mid, lat_mid, east),
+            (lat_mid, west, north, lon_mid), (lat_mid, lon_mid, north, east),
+        ]
+        all_elements, tile_errors = [], []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_overpass_parallel, tile): i for i, tile in enumerate(tiles, 1)}
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    all_elements.extend(future.result().get("elements", []))
+                except Exception as exc:
+                    tile_errors.append(f"tile {i}: {exc}")
+        if not all_elements:
+            raise RuntimeError(f"Road network download failed: {first_error}; fallback: {' | '.join(tile_errors)}")
 
-    Splitting the city into tiles prevents a single large Overpass response
-    from timing out or being rejected by a proxy on a small cloud instance.
-    The final graph is still entirely generated from OpenStreetMap road data;
-    there are no predefined locations or hard-coded road edges.
-    """
-    south, west, north, east = BBOX
-    lat_mid = (south + north) / 2
-    lon_step = (east - west) / 3
-    lon_cuts = [west, west + lon_step, west + 2 * lon_step, east]
-    tiles = []
-    for r_s, r_n in [(south, lat_mid), (lat_mid, north)]:
-        for c in range(3):
-            tiles.append((r_s, lon_cuts[c], r_n, lon_cuts[c + 1]))
-
-    all_elements = []
-    tile_errors = []
-    for i, tile in enumerate(tiles, 1):
-        try:
-            data = fetch_overpass_tile(tile, OVERPASS_URLS, i)
-            all_elements.extend(data.get("elements", []))
-        except Exception as exc:
-            tile_errors.append(str(exc))
-
-    if not all_elements:
-        raise RuntimeError("No road data was downloaded. " + " | ".join(tile_errors))
-    if len(tile_errors) >= 3:
-        raise RuntimeError("Too many road-network tiles failed. " + " | ".join(tile_errors))
-
-    coord_to_idx = {}
-    graph_nodes = []
-    edge_map = {}
-
+    coord_to_idx, graph_nodes, edge_map = {}, [], {}
     def node_index(lat, lon):
         key = (round(float(lat), 7), round(float(lon), 7))
         idx = coord_to_idx.get(key)
         if idx is None:
-            idx = len(graph_nodes)
-            coord_to_idx[key] = idx
-            graph_nodes.append([key[0], key[1]])
+            idx = len(graph_nodes); coord_to_idx[key] = idx; graph_nodes.append([key[0], key[1]])
         return idx
 
     for element in all_elements:
-        if element.get("type") != "way":
-            continue
-        tags = element.get("tags", {})
-        highway = tags.get("highway")
+        if element.get("type") != "way": continue
+        tags = element.get("tags", {}); highway = tags.get("highway")
         geometry = element.get("geometry", [])
-        if not highway or len(geometry) < 2:
-            continue
-
+        if not highway or len(geometry) < 2: continue
         speed = parse_speed(tags.get("maxspeed"), highway)
         oneway_value = str(tags.get("oneway", "")).lower()
         oneway = oneway_value in ("yes", "1", "true")
-        reverse_way = oneway_value == "-1"
-        if reverse_way:
-            geometry = list(reversed(geometry))
-            oneway = True
-
+        if oneway_value == "-1": geometry = list(reversed(geometry)); oneway = True
         for a, b in zip(geometry, geometry[1:]):
-            try:
-                lat1, lon1 = float(a["lat"]), float(a["lon"])
-                lat2, lon2 = float(b["lat"]), float(b["lon"])
-            except (KeyError, TypeError, ValueError):
-                continue
+            try: lat1, lon1 = float(a["lat"]), float(a["lon"]); lat2, lon2 = float(b["lat"]), float(b["lon"])
+            except (KeyError, TypeError, ValueError): continue
             u, v = node_index(lat1, lon1), node_index(lat2, lon2)
             d = haversine_km((lat1, lon1), (lat2, lon2))
-            if d <= 0 or d > 2:
-                continue
+            if d <= 0 or d > 2: continue
             t = d / speed * 60.0
-            key = (u, v, int(oneway))
-            old = edge_map.get(key)
-            if old is None or t < old[1]:
-                edge_map[key] = (d, t)
+            key = (u, v, int(oneway)); old = edge_map.get(key)
+            if old is None or t < old[1]: edge_map[key] = (d, t)
 
     graph_edges = [[u, v, d, t, one_way] for (u, v, one_way), (d, t) in edge_map.items()]
-    graph = {
-        "generatedAt": time.time(),
-        "bbox": list(BBOX),
-        "nodes": graph_nodes,
-        "edges": graph_edges,
-        "source": "OpenStreetMap road data via Overpass API (6 tiled way-geometry requests)",
-        "tilesSucceeded": len(tiles) - len(tile_errors),
-        "tilesTotal": len(tiles),
-    }
-    if len(graph_nodes) < 100 or len(graph_edges) < 100:
-        raise RuntimeError("The road-network API returned too little road data.")
-
+    graph = {"generatedAt": time.time(), "bbox": list(bbox), "nodes": graph_nodes, "edges": graph_edges,
+             "source": "OpenStreetMap road data via Overpass API (route-sized dynamic graph)"}
+    if len(graph_nodes) < 100 or len(graph_edges) < 100: raise RuntimeError("The road-network API returned too little road data.")
     os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(graph, f, separators=(",", ":"))
+    with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump(graph, f, separators=(",", ":"))
     return graph
 
 
-def load_graph(force=False):
+def graph_covers_points(graph, points):
+    if not graph or not points: return False
+    south, west, north, east = graph.get("bbox", BBOX)
+    return all(south <= p[0] <= north and west <= p[1] <= east for p in points)
+
+
+def route_bbox(source, destination):
+    min_lat, max_lat = min(source[0], destination[0]), max(source[0], destination[0])
+    min_lon, max_lon = min(source[1], destination[1]), max(source[1], destination[1])
+    lat_pad, lon_pad = max(0.012, (max_lat-min_lat)*0.25), max(0.015, (max_lon-min_lon)*0.25)
+    return (max(BBOX[0], min_lat-lat_pad), max(BBOX[1], min_lon-lon_pad),
+            min(BBOX[2], max_lat+lat_pad), min(BBOX[3], max_lon+lon_pad))
+
+
+def load_graph(force=False, points=None):
     if not force and os.path.exists(CACHE_FILE):
         try:
             if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-    return fetch_osm_graph()
-
+                with open(CACHE_FILE, "r", encoding="utf-8") as f: graph = json.load(f)
+                if not points or graph_covers_points(graph, points): return graph
+        except Exception: pass
+    bbox = route_bbox(points[0], points[1]) if points and len(points) == 2 else BBOX
+    return fetch_osm_graph(bbox)
 
 def write_cpp_graph(graph):
     """Write a compact text representation consumed by the C++ Dijkstra engine."""
@@ -341,17 +335,15 @@ def geocode():
 
 @app.get("/api/network")
 def network():
+    # Status-only endpoint: opening the page never starts an expensive Overpass download.
+    if not os.path.exists(CACHE_FILE):
+        return jsonify({"ready": False, "message": "Road network will be downloaded when you calculate a route."})
     try:
-        graph = load_graph()
-        return jsonify({
-            "nodeCount": len(graph["nodes"]),
-            "edgeCount": len(graph["edges"]),
-            "bbox": graph["bbox"],
-            "source": graph["source"],
-        })
-    except Exception as e:
-        return jsonify({"error": f"Could not download road network: {e}"}), 503
-
+        with open(CACHE_FILE, "r", encoding="utf-8") as f: graph = json.load(f)
+        return jsonify({"ready": True, "nodeCount": len(graph.get("nodes", [])), "edgeCount": len(graph.get("edges", [])),
+                        "bbox": graph.get("bbox", BBOX), "source": graph.get("source", "OpenStreetMap")})
+    except Exception:
+        return jsonify({"ready": False, "message": "Road network will be downloaded when you calculate a route."})
 
 @app.post("/api/refresh-network")
 def refresh_network():
@@ -376,7 +368,7 @@ def route():
         source_point = [float(source[0]), float(source[1])]
         dest_point = [float(destination[0]), float(destination[1])]
 
-        graph = load_graph()
+        graph = load_graph(points=[source_point, dest_point])
         graph_file = write_cpp_graph(graph)
         source_node, source_snap = nearest_node(graph, source_point)
         dest_node, dest_snap = nearest_node(graph, dest_point)
