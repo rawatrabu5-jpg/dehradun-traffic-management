@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 import http.client
+import gzip
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
@@ -17,7 +18,7 @@ CACHE_FILE = os.path.join(ROOT, "backend", "dehradun_osm_graph.json")
 CACHE_TTL = 60 * 60 * 6  # refresh the downloaded road network every 6 hours
 
 # Dehradun city-area bounding box: south, west, north, east.
-BBOX = (30.28, 77.90, 30.42, 78.14)
+BBOX = (30.29, 77.91, 30.41, 78.16)
 OVERPASS_URLS = [
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
@@ -73,6 +74,11 @@ IPV4_OPENER = urllib.request.build_opener(IPv4HTTPSHandler)
 
 app = Flask(__name__, static_folder=FRONTEND, static_url_path="")
 
+# Nominatim geocoding cache/rate-limit. Search is performed server-side so
+# the browser does not need direct access to the geocoding service.
+GEOCODE_CACHE = {}
+LAST_GEOCODE_AT = 0.0
+
 
 def haversine_km(a, b):
     lat1, lon1 = a
@@ -114,100 +120,104 @@ def parse_speed(value, highway):
 
 
 def fetch_osm_graph():
+    """Download a compact road graph from Overpass.
+
+    We request road ways with their geometry directly. This avoids the much
+    larger two-stage `out body; >; out skel` response and is considerably more
+    reliable on small cloud instances.
+    """
     s, w, n, e = BBOX
-    query = f"""[out:json][timeout:90];
-way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|construction|proposed|bridleway|corridor|raceway)$\"]({s},{w},{n},{e});
-out body;
->;
-out skel qt;"""
+    query = f"""[out:json][timeout:50][maxsize:536870912];
+way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|construction|proposed|bridleway|corridor|raceway|service)$\"]({s},{w},{n},{e});
+out geom qt;"""
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
     headers = {
-        "User-Agent": "DehradunTrafficPBL/2.1 (educational project)",
+        "User-Agent": "DehradunTrafficPBL/2.2 (educational project)",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "Connection": "close",
     }
 
     errors = []
     data = None
     for endpoint in OVERPASS_URLS:
-        req = urllib.request.Request(
-            endpoint,
-            data=encoded,
-            headers=headers,
-            method="POST",
-        )
+        req = urllib.request.Request(endpoint, data=encoded, headers=headers, method="POST")
         try:
-            with IPV4_OPENER.open(req, timeout=120) as response:
-                data = json.load(response)
+            with IPV4_OPENER.open(req, timeout=70) as response:
+                raw = response.read()
+                if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw.decode("utf-8"))
             break
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
 
     if data is None:
-        raise RuntimeError(
-            "All Overpass API endpoints failed. " + " | ".join(errors)
-        )
+        raise RuntimeError("All Overpass API endpoints failed. " + " | ".join(errors))
 
-    nodes = {}
-    ways = []
+    # Build graph directly from each way's geometry. Consecutive geometry
+    # points become graph edges; no predefined locations or edges are used.
+    coord_to_idx = {}
+    graph_nodes = []
+    edge_map = {}
+
+    def node_index(lat, lon):
+        # OSM geometry coordinates have enough precision for routing. Rounding
+        # also merges shared way vertices reliably between adjacent ways.
+        key = (round(float(lat), 7), round(float(lon), 7))
+        idx = coord_to_idx.get(key)
+        if idx is None:
+            idx = len(graph_nodes)
+            coord_to_idx[key] = idx
+            graph_nodes.append([key[0], key[1]])
+        return idx
+
     for element in data.get("elements", []):
-        if element.get("type") == "node" and "lat" in element and "lon" in element:
-            nodes[element["id"]] = [element["lat"], element["lon"]]
-        elif element.get("type") == "way":
-            tags = element.get("tags", {})
-            highway = tags.get("highway")
-            refs = element.get("nodes", [])
-            if highway and len(refs) >= 2:
-                ways.append((refs, tags))
+        if element.get("type") != "way":
+            continue
+        tags = element.get("tags", {})
+        highway = tags.get("highway")
+        geometry = element.get("geometry", [])
+        if not highway or len(geometry) < 2:
+            continue
 
-    # Keep only OSM nodes that participate in a routable road way.
-    used = set()
-    for refs, _ in ways:
-        used.update(refs)
-    used &= set(nodes)
-
-    node_ids = sorted(used)
-    id_to_idx = {osm_id: i for i, osm_id in enumerate(node_ids)}
-    graph_nodes = [nodes[x] for x in node_ids]
-    edges = {}
-
-    for refs, tags in ways:
-        highway = tags.get("highway", "residential")
         speed = parse_speed(tags.get("maxspeed"), highway)
-        oneway = str(tags.get("oneway", "")).lower() in ("yes", "1", "true")
-        if str(tags.get("oneway", "")).lower() == "-1":
-            refs = list(reversed(refs))
+        oneway_value = str(tags.get("oneway", "")).lower()
+        oneway = oneway_value in ("yes", "1", "true")
+        reverse_way = oneway_value == "-1"
+        if reverse_way:
+            geometry = list(reversed(geometry))
             oneway = True
 
-        for a, b in zip(refs, refs[1:]):
-            if a not in id_to_idx or b not in id_to_idx:
+        for a, b in zip(geometry, geometry[1:]):
+            try:
+                lat1, lon1 = float(a["lat"]), float(a["lon"])
+                lat2, lon2 = float(b["lat"]), float(b["lon"])
+            except (KeyError, TypeError, ValueError):
                 continue
-            u, v = id_to_idx[a], id_to_idx[b]
-            d = haversine_km(nodes[a], nodes[b])
+            u, v = node_index(lat1, lon1), node_index(lat2, lon2)
+            d = haversine_km((lat1, lon1), (lat2, lon2))
             if d <= 0 or d > 2:
                 continue
             t = d / speed * 60.0
             key = (u, v, int(oneway))
-            # If multiple OSM ways create the same edge, retain the fastest estimate.
-            old = edges.get(key)
+            old = edge_map.get(key)
             if old is None or t < old[1]:
-                edges[key] = (d, t)
+                edge_map[key] = (d, t)
 
-    graph_edges = [
-        [u, v, d, t, one_way]
-        for (u, v, one_way), (d, t) in edges.items()
-    ]
-
+    graph_edges = [[u, v, d, t, one_way] for (u, v, one_way), (d, t) in edge_map.items()]
     graph = {
         "generatedAt": time.time(),
         "bbox": list(BBOX),
         "nodes": graph_nodes,
         "edges": graph_edges,
-        "source": "OpenStreetMap road data via Overpass API",
+        "source": "OpenStreetMap road data via Overpass API (way geometry)",
     }
     if len(graph_nodes) < 100 or len(graph_edges) < 100:
         raise RuntimeError("The road-network API returned too little road data.")
 
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(graph, f, separators=(",", ":"))
     return graph
@@ -249,6 +259,63 @@ def nearest_node(graph, point):
 @app.get("/")
 def index():
     return send_from_directory(FRONTEND, "index.html")
+
+
+@app.get("/api/geocode")
+def geocode():
+    """Search for a place/address in or near Dehradun using Nominatim."""
+    global LAST_GEOCODE_AT
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"error": "Enter at least 2 characters to search."}), 400
+
+    # Prefer Dehradun results while still allowing nearby addresses.
+    cache_key = q.lower()
+    if cache_key in GEOCODE_CACHE:
+        return jsonify({"results": GEOCODE_CACHE[cache_key]})
+
+    # Nominatim asks clients to identify themselves and avoid heavy usage.
+    wait = 1.0 - (time.time() - LAST_GEOCODE_AT)
+    if wait > 0:
+        time.sleep(wait)
+
+    params = urllib.parse.urlencode({
+        "q": q,
+        "format": "jsonv2",
+        "limit": "5",
+        "countrycodes": "in",
+        "viewbox": f"{BBOX[1]},{BBOX[2]},{BBOX[3]},{BBOX[0]}",
+        "bounded": "1",
+    })
+    url = "https://nominatim.openstreetmap.org/search?" + params
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "DehradunTrafficPBL/3.0 (educational project)",
+        "Accept": "application/json",
+    })
+    try:
+        with IPV4_OPENER.open(req, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        LAST_GEOCODE_AT = time.time()
+    except Exception as exc:
+        return jsonify({"error": f"Location search is temporarily unavailable: {exc}"}), 503
+
+    results = []
+    for item in data:
+        try:
+            lat, lon = float(item["lat"]), float(item["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Nominatim is bounded above, but keep an explicit safety check.
+        if BBOX[0] <= lat <= BBOX[2] and BBOX[1] <= lon <= BBOX[3]:
+            results.append({
+                "displayName": item.get("display_name", q),
+                "lat": lat,
+                "lon": lon,
+                "type": item.get("type", ""),
+            })
+
+    GEOCODE_CACHE[cache_key] = results
+    return jsonify({"results": results})
 
 
 @app.get("/api/network")

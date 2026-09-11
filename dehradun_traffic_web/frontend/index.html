@@ -22,6 +22,7 @@
     #map{min-height:100vh}.legend{position:absolute;z-index:900;right:20px;bottom:20px;background:#fff;padding:12px 14px;border-radius:10px;box-shadow:0 2px 12px #0002;font-size:12px}
     .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.trafficbox{margin-top:16px;border-top:1px solid #e3e8ec;padding-top:14px}
     .trafficbox input{width:100%;padding:9px;border:1px solid #ccd6dd;border-radius:8px}.small{font-size:11px;color:#66737f;line-height:1.4}
+    .searchrow{display:grid;grid-template-columns:1fr 76px;gap:6px}.searchrow input{width:100%;height:40px;border:1px solid #ccd6dd;border-radius:9px;padding:0 10px;font-size:13px}.mini{height:40px;margin-top:0;padding:0 8px;font-size:12px}.results{margin-top:6px}.result{padding:9px;border:1px solid #d5dde3;border-radius:9px;background:#fff;margin-bottom:5px;font-size:12px;cursor:pointer}.result:hover{background:#f3f7fa}.result b{display:block;margin-bottom:2px}.result span{color:#66737f}.secondary{background:#f4f7f9;color:#24313c;border-color:#d5dde3}
     @media(max-width:850px){.app{grid-template-columns:1fr}.panel{border-right:0}.map-wrap{height:60vh}#map{min-height:60vh}}
   </style>
 </head>
@@ -30,13 +31,20 @@
   <aside class="panel">
     <h1>Smart Intelligent Dehradun Traffic</h1>
     <div class="sub">Real OpenStreetMap road network • C++ Dijkstra • Leaflet</div>
-    <div class="hint"><b>No predefined locations.</b><br>Click the map to choose your source and destination. The backend downloads the real Dehradun road network from OpenStreetMap through the Overpass API and builds the graph automatically.</div>
+    <div class="hint"><b>Search instead of manually finding places.</b><br>Use your current GPS location for the source, or search for a starting place. Search the destination by name/address and the map will automatically move to it. The road network is generated from OpenStreetMap through the Overpass API.</div>
 
-    <div class="point"><b><span class="source-dot">●</span> Source</b><span id="sourceText" class="coords">Not selected — click “Set Source”, then click the map.</span></div>
-    <div class="point"><b><span class="dest-dot">●</span> Destination</b><span id="destText" class="coords">Not selected — click “Set Destination”, then click the map.</span></div>
+    <label for="sourceSearch">Current / Source location</label>
+    <div class="searchrow"><input id="sourceSearch" placeholder="e.g. Clock Tower, Dehradun"><button id="sourceSearchBtn" class="mini">Search</button></div>
+    <button id="locate" class="secondary">📍 Use My Current Location</button>
+    <div class="point"><b><span class="source-dot">●</span> Source</b><span id="sourceText" class="coords">Not selected</span></div>
 
-    <button id="setSource">Set Source on Map</button>
-    <button id="setDestination">Set Destination on Map</button>
+    <label for="destSearch">Destination</label>
+    <div class="searchrow"><input id="destSearch" placeholder="e.g. ISBT Dehradun"><button id="destSearchBtn" class="mini">Search</button></div>
+    <div id="searchResults" class="results"></div>
+    <div class="point"><b><span class="dest-dot">●</span> Destination</b><span id="destText" class="coords">Not selected</span></div>
+
+    <button id="setSource" class="secondary">Set Source by Map Click</button>
+    <button id="setDestination" class="secondary">Set Destination by Map Click</button>
     <button id="find">Find Optimal Route</button>
     <button id="refresh" class="secondary">Refresh Road Network API</button>
     <div id="msg" class="msg"></div>
@@ -70,38 +78,104 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const state={source:null,destination:null,mode:null,sourceMarker:null,destMarker:null,routeLayer:null};
+const state={source:null,destination:null,mode:null,sourceMarker:null,destMarker:null,routeLayer:null,watchId:null};
 const $=id=>document.getElementById(id);
 const map=L.map('map').setView([30.338,78.055],13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
 
 function fmt(p){return `${p[0].toFixed(6)}, ${p[1].toFixed(6)}`;}
-function setMarker(kind,p){
+function setMarker(kind,p,label){
   if(kind==='source'){
     if(state.sourceMarker)state.sourceMarker.remove();
-    state.sourceMarker=L.marker(p).addTo(map).bindPopup('Source').openPopup();
-    $('sourceText').textContent=fmt(p);
+    state.sourceMarker=L.marker(p).addTo(map).bindPopup(label||'Source');
+    $('sourceText').textContent=label ? `${label} (${fmt(p)})` : fmt(p);
   }else{
     if(state.destMarker)state.destMarker.remove();
-    state.destMarker=L.marker(p).addTo(map).bindPopup('Destination').openPopup();
-    $('destText').textContent=fmt(p);
+    state.destMarker=L.marker(p).addTo(map).bindPopup(label||'Destination').openPopup();
+    $('destText').textContent=label ? `${label} (${fmt(p)})` : fmt(p);
   }
+}
+
+function selectPoint(kind,p,label){
+  if(kind==='source')state.source=p; else state.destination=p;
+  setMarker(kind,p,label);
+  map.setView(p,15);
 }
 
 map.on('click',e=>{
   if(!state.mode)return;
   const p=[e.latlng.lat,e.latlng.lng];
-  if(state.mode==='source'){state.source=p;setMarker('source',p);$('msg').textContent='Source selected. Now set destination or calculate the route.';}
-  else {state.destination=p;setMarker('destination',p);$('msg').textContent='Destination selected. Click Find Optimal Route.';}
+  selectPoint(state.mode,p,'Map-selected location');
+  $('msg').textContent=state.mode==='source'?'Source selected.':'Destination selected.';
   state.mode=null;map.getContainer().style.cursor='';
 });
 
 $('setSource').onclick=()=>{state.mode='source';map.getContainer().style.cursor='crosshair';$('msg').textContent='Click the map to select the source.';};
 $('setDestination').onclick=()=>{state.mode='destination';map.getContainer().style.cursor='crosshair';$('msg').textContent='Click the map to select the destination.';};
 
+async function searchPlace(query,forKind){
+  if(!query.trim()){ $('msg').textContent='Enter a place or address first.'; return; }
+  $('msg').textContent='Searching for location…';
+  const r=await fetch('/api/geocode?q='+encodeURIComponent(query.trim()));
+  const d=await r.json().catch(()=>({error:'Location search returned an invalid response.'}));
+  if(!r.ok){$('msg').textContent=d.error||'Location search failed.';return;}
+  if(!d.results.length){$('msg').textContent='No matching place found inside the Dehradun search area.';return;}
+  if(forKind==='source'){
+    const item=d.results[0];
+    selectPoint('source',[item.lat,item.lon],item.displayName);
+    $('msg').textContent='Source found and marked on the map.';
+    return;
+  }
+  $('searchResults').innerHTML=d.results.map((x,i)=>`<div class="result" data-i="${i}"><b>${x.displayName}</b><span>${x.type||'location'}</span></div>`).join('');
+  [...document.querySelectorAll('.result')].forEach((el,i)=>el.onclick=()=>{
+    const item=d.results[i];
+    selectPoint('destination',[item.lat,item.lon],item.displayName);
+    $('searchResults').innerHTML='';
+    $('msg').textContent='Destination found and marked on the map. Click Find Optimal Route.';
+  });
+}
+
+$('sourceSearchBtn').onclick=()=>searchPlace($('sourceSearch').value,'source').catch(e=>$('msg').textContent=e.message);
+$('destSearchBtn').onclick=()=>searchPlace($('destSearch').value,'destination').catch(e=>$('msg').textContent=e.message);
+$('sourceSearch').addEventListener('keydown',e=>{if(e.key==='Enter')$('sourceSearchBtn').click();});
+$('destSearch').addEventListener('keydown',e=>{if(e.key==='Enter')$('destSearchBtn').click();});
+
+function updateCurrentLocation(position){
+  const p=[position.coords.latitude,position.coords.longitude];
+  state.source=p;
+  setMarker('source',p,'My current location');
+  $('sourceSearch').value='My current location';
+  $('msg').textContent='Your current location is being used as the source.';
+}
+
+function locateUser(){
+  if(!navigator.geolocation){$('msg').textContent='Your browser does not support location services.';return;}
+  $('msg').textContent='Requesting your current location…';
+  navigator.geolocation.getCurrentPosition(updateCurrentLocation,err=>{
+    $('msg').textContent=err.code===1?'Location permission was denied. You can search for the source instead.':'Could not get your current location. You can search for the source instead.';
+  },{enableHighAccuracy:true,timeout:15000,maximumAge:10000});
+}
+$('locate').onclick=locateUser;
+
+// Automatically request the current position once. The browser will ask the
+// user for permission; if declined, the search fields still work normally.
+setTimeout(locateUser,700);
+
 async function loadNetwork(){
   $('msg').textContent='Downloading/checking the real Dehradun road network…';
-  const r=await fetch('/api/network');const d=await r.json();
+  const r=await fetch('/api/network');
+  const text=await r.text();
+  let d; try { d=JSON.parse(text); } catch (_) { throw new Error(`Server returned an unexpected response (${r.status}). Please wait a little and refresh the page.`); }
+  if(!r.ok)throw new Error(d.error||'Road network unavailable');
+  $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
+  $('msg').textContent=`API road graph ready: ${d.nodeCount.toLocaleString()} nodes and ${d.edgeCount.toLocaleString()} edges.`;
+}
+
+async function loadNetwork(){
+  $('msg').textContent='Downloading/checking the real Dehradun road network…';
+  const r=await fetch('/api/network');
+  const text=await r.text();
+  let d; try { d=JSON.parse(text); } catch (_) { throw new Error(`Server returned an unexpected response (${r.status}). Please wait a little and refresh the page.`); }
   if(!r.ok)throw new Error(d.error||'Road network unavailable');
   $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
   $('msg').textContent=`API road graph ready: ${d.nodeCount.toLocaleString()} nodes and ${d.edgeCount.toLocaleString()} edges.`;
@@ -129,7 +203,7 @@ async function findRoute(){
 $('find').onclick=()=>findRoute().catch(e=>$('msg').textContent=e.message);
 $('refresh').onclick=async()=>{
   $('msg').textContent='Refreshing road data from Overpass…';
-  try{const r=await fetch('/api/refresh-network',{method:'POST'});const d=await r.json();if(!r.ok)throw new Error(d.error);$('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;$('msg').textContent='Road network refreshed successfully.';}catch(e){$('msg').textContent=e.message;}
+  try{const r=await fetch('/api/refresh-network',{method:'POST'});const text=await r.text();let d;try{d=JSON.parse(text)}catch(_){throw new Error(`Server returned an unexpected response (${r.status}). Please wait and try again.`)}if(!r.ok)throw new Error(d.error);$('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;$('msg').textContent='Road network refreshed successfully.';}catch(e){$('msg').textContent=e.message;}
 };
 loadNetwork().catch(e=>$('msg').textContent=e.message);
 </script>
