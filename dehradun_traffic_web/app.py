@@ -335,15 +335,18 @@ def geocode():
 
 @app.get("/api/network")
 def network():
-    # Status-only endpoint: opening the page never starts an expensive Overpass download.
+    # Lightweight status endpoint. Never open/parse the potentially large graph
+    # file here; doing so can make a small Render instance hit a timeout/502.
     if not os.path.exists(CACHE_FILE):
-        return jsonify({"ready": False, "message": "Road network will be downloaded when you calculate a route."})
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f: graph = json.load(f)
-        return jsonify({"ready": True, "nodeCount": len(graph.get("nodes", [])), "edgeCount": len(graph.get("edges", [])),
-                        "bbox": graph.get("bbox", BBOX), "source": graph.get("source", "OpenStreetMap")})
-    except Exception:
-        return jsonify({"ready": False, "message": "Road network will be downloaded when you calculate a route."})
+        return jsonify({
+            "ready": False,
+            "message": "Road network will be downloaded when you calculate a route."
+        })
+    return jsonify({
+        "ready": True,
+        "message": "Road network cache is available. It will be used when you calculate a route.",
+        "source": "OpenStreetMap road data via Overpass API"
+    })
 
 @app.post("/api/refresh-network")
 def refresh_network():
