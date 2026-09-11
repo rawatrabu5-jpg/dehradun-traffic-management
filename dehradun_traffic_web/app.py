@@ -10,13 +10,21 @@ import urllib.parse
 import urllib.request
 import http.client
 import gzip
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
 ENGINE = os.path.join(ROOT, "backend", "route_engine.exe" if os.name == "nt" else "route_engine")
 CACHE_FILE = os.path.join(ROOT, "backend", "dehradun_osm_graph.json")
-CACHE_TTL = 60 * 60 * 6  # refresh the downloaded road network every 6 hours
+CACHE_TTL = 60 * 60 * 24 * 7  # road layout barely changes; refresh weekly at most.
+# The graph is normally pre-baked into CACHE_FILE at build time (see
+# prebake_graph.py) so a live request should almost never need to hit
+# Overpass at all. These knobs only matter for the rare cold-cache case,
+# so they're tuned to fail fast rather than risk a platform gateway
+# timeout (e.g. Render's free-tier proxy) while a request is in flight.
+OVERPASS_ENDPOINT_TIMEOUT = 7      # seconds per mirror
+OVERPASS_OVERALL_BUDGET = 12       # seconds to wait across all mirrors combined
+FALLBACK_TILE_TIMEOUT = 7          # seconds per fallback tile request
 
 # Dehradun city-area bounding box: south, west, north, east.
 BBOX = (30.24, 77.90, 30.42, 78.20)
@@ -128,7 +136,7 @@ way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|c
 out geom qt;"""
 
 
-def fetch_overpass_endpoint(endpoint, query, timeout=18):
+def fetch_overpass_endpoint(endpoint, query, timeout=OVERPASS_ENDPOINT_TIMEOUT):
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
     req = urllib.request.Request(endpoint, data=encoded, headers={
         "User-Agent": "DehradunTrafficPBL/5.0 (educational project)",
@@ -145,20 +153,28 @@ def fetch_overpass_endpoint(endpoint, query, timeout=18):
 
 
 def fetch_overpass_parallel(bbox):
-    """Race several Overpass mirrors so one slow mirror cannot block the app."""
+    """Race several Overpass mirrors so one slow mirror cannot block the app.
+
+    Bounded by OVERPASS_OVERALL_BUDGET regardless of how many mirrors are
+    still pending, so a live (cache-miss) request fails quickly instead of
+    piling up close to the host's gateway timeout.
+    """
     query = overpass_query(bbox)
     errors = []
     with ThreadPoolExecutor(max_workers=len(OVERPASS_URLS)) as pool:
         futures = {pool.submit(fetch_overpass_endpoint, url, query): url for url in OVERPASS_URLS}
-        for future in as_completed(futures):
-            url = futures[future]
-            try:
-                data = future.result()
-                if data.get("elements"):
-                    return data
-                errors.append(f"{url}: empty response")
-            except Exception as exc:
-                errors.append(f"{url}: {exc}")
+        try:
+            for future in as_completed(futures, timeout=OVERPASS_OVERALL_BUDGET):
+                url = futures[future]
+                try:
+                    data = future.result()
+                    if data.get("elements"):
+                        return data
+                    errors.append(f"{url}: empty response")
+                except Exception as exc:
+                    errors.append(f"{url}: {exc}")
+        except TimeoutError:
+            errors.append(f"overall budget of {OVERPASS_OVERALL_BUDGET}s exceeded")
     raise RuntimeError("All Overpass servers failed: " + " | ".join(errors))
 
 
@@ -180,12 +196,15 @@ def fetch_osm_graph(bbox=None):
         all_elements, tile_errors = [], []
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(fetch_overpass_parallel, tile): i for i, tile in enumerate(tiles, 1)}
-            for future in as_completed(futures):
-                i = futures[future]
-                try:
-                    all_elements.extend(future.result().get("elements", []))
-                except Exception as exc:
-                    tile_errors.append(f"tile {i}: {exc}")
+            try:
+                for future in as_completed(futures, timeout=FALLBACK_TILE_TIMEOUT * 2):
+                    i = futures[future]
+                    try:
+                        all_elements.extend(future.result().get("elements", []))
+                    except Exception as exc:
+                        tile_errors.append(f"tile {i}: {exc}")
+            except TimeoutError:
+                tile_errors.append(f"fallback tiling exceeded {FALLBACK_TILE_TIMEOUT * 2}s budget")
         if not all_elements:
             raise RuntimeError(f"Road network download failed: {first_error}; fallback: {' | '.join(tile_errors)}")
 
@@ -274,6 +293,15 @@ def nearest_node(graph, point):
 @app.get("/")
 def index():
     return send_from_directory(FRONTEND, "index.html")
+
+
+@app.get("/healthz")
+def healthz():
+    # Intentionally does no graph loading, no subprocess calls, no network
+    # requests — just proves the process is alive. Point an external
+    # uptime pinger (UptimeRobot, cron-job.org, etc.) at this URL every
+    # ~10 minutes to keep a Render free-tier instance from spinning down.
+    return jsonify({"ok": True, "ts": time.time()})
 
 
 @app.get("/api/geocode")

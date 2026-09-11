@@ -3,6 +3,6 @@ services:
     name: dehradun-traffic-management
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && g++ -std=c++17 -O2 backend/route_engine.cpp -o backend/route_engine
-    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
-    healthCheckPath: /
+    buildCommand: pip install -r requirements.txt && g++ -std=c++17 -O2 backend/route_engine.cpp -o backend/route_engine && python prebake_graph.py
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 60 app:app
+    healthCheckPath: /healthz
