@@ -119,52 +119,71 @@ def parse_speed(value, highway):
         return default_speed(highway)
 
 
-def fetch_osm_graph():
-    """Download a compact road graph from Overpass.
-
-    We request road ways with their geometry directly. This avoids the much
-    larger two-stage `out body; >; out skel` response and is considerably more
-    reliable on small cloud instances.
-    """
-    s, w, n, e = BBOX
-    query = f"""[out:json][timeout:50][maxsize:536870912];
+def fetch_overpass_tile(bbox, endpoint_urls, tile_no):
+    """Fetch one smaller Overpass tile, trying multiple endpoints."""
+    s, w, n, e = bbox
+    query = f"""[out:json][timeout:35][maxsize:268435456];
 way[\"highway\"][\"highway\"!~\"^(footway|path|cycleway|steps|pedestrian|track|construction|proposed|bridleway|corridor|raceway|service)$\"]({s},{w},{n},{e});
 out geom qt;"""
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
     headers = {
-        "User-Agent": "DehradunTrafficPBL/2.2 (educational project)",
+        "User-Agent": "DehradunTrafficPBL/4.0 (educational project)",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "Connection": "close",
     }
-
     errors = []
-    data = None
-    for endpoint in OVERPASS_URLS:
+    for endpoint in endpoint_urls:
         req = urllib.request.Request(endpoint, data=encoded, headers=headers, method="POST")
         try:
-            with IPV4_OPENER.open(req, timeout=70) as response:
+            with IPV4_OPENER.open(req, timeout=45) as response:
                 raw = response.read()
                 if response.headers.get("Content-Encoding", "").lower() == "gzip":
                     raw = gzip.decompress(raw)
                 data = json.loads(raw.decode("utf-8"))
-            break
+            return data
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
+    raise RuntimeError(f"Overpass tile {tile_no} failed: " + " | ".join(errors))
 
-    if data is None:
-        raise RuntimeError("All Overpass API endpoints failed. " + " | ".join(errors))
 
-    # Build graph directly from each way's geometry. Consecutive geometry
-    # points become graph edges; no predefined locations or edges are used.
+def fetch_osm_graph():
+    """Download the Dehradun road graph in several smaller Overpass tiles.
+
+    Splitting the city into tiles prevents a single large Overpass response
+    from timing out or being rejected by a proxy on a small cloud instance.
+    The final graph is still entirely generated from OpenStreetMap road data;
+    there are no predefined locations or hard-coded road edges.
+    """
+    south, west, north, east = BBOX
+    lat_mid = (south + north) / 2
+    lon_step = (east - west) / 3
+    lon_cuts = [west, west + lon_step, west + 2 * lon_step, east]
+    tiles = []
+    for r_s, r_n in [(south, lat_mid), (lat_mid, north)]:
+        for c in range(3):
+            tiles.append((r_s, lon_cuts[c], r_n, lon_cuts[c + 1]))
+
+    all_elements = []
+    tile_errors = []
+    for i, tile in enumerate(tiles, 1):
+        try:
+            data = fetch_overpass_tile(tile, OVERPASS_URLS, i)
+            all_elements.extend(data.get("elements", []))
+        except Exception as exc:
+            tile_errors.append(str(exc))
+
+    if not all_elements:
+        raise RuntimeError("No road data was downloaded. " + " | ".join(tile_errors))
+    if len(tile_errors) >= 3:
+        raise RuntimeError("Too many road-network tiles failed. " + " | ".join(tile_errors))
+
     coord_to_idx = {}
     graph_nodes = []
     edge_map = {}
 
     def node_index(lat, lon):
-        # OSM geometry coordinates have enough precision for routing. Rounding
-        # also merges shared way vertices reliably between adjacent ways.
         key = (round(float(lat), 7), round(float(lon), 7))
         idx = coord_to_idx.get(key)
         if idx is None:
@@ -173,7 +192,7 @@ out geom qt;"""
             graph_nodes.append([key[0], key[1]])
         return idx
 
-    for element in data.get("elements", []):
+    for element in all_elements:
         if element.get("type") != "way":
             continue
         tags = element.get("tags", {})
@@ -212,7 +231,9 @@ out geom qt;"""
         "bbox": list(BBOX),
         "nodes": graph_nodes,
         "edges": graph_edges,
-        "source": "OpenStreetMap road data via Overpass API (way geometry)",
+        "source": "OpenStreetMap road data via Overpass API (6 tiled way-geometry requests)",
+        "tilesSucceeded": len(tiles) - len(tile_errors),
+        "tilesTotal": len(tiles),
     }
     if len(graph_nodes) < 100 or len(graph_edges) < 100:
         raise RuntimeError("The road-network API returned too little road data.")
