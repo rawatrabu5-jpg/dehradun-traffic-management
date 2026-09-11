@@ -2,10 +2,13 @@ from flask import Flask, jsonify, request, send_from_directory
 import json
 import math
 import os
+import socket
+import ssl
 import subprocess
 import time
 import urllib.parse
 import urllib.request
+import http.client
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
@@ -15,7 +18,58 @@ CACHE_TTL = 60 * 60 * 6  # refresh the downloaded road network every 6 hours
 
 # Dehradun city-area bounding box: south, west, north, east.
 BBOX = (30.28, 77.90, 30.42, 78.14)
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+]
+
+
+class IPv4HTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that deliberately uses IPv4 addresses.
+
+    Some cloud environments can resolve an Overpass hostname to IPv6 while
+    having no working IPv6 route, which produces Errno 101 (Network is
+    unreachable). This connection class avoids that failure mode.
+    """
+
+    def connect(self):
+        timeout = self.timeout
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            timeout = None
+
+        last_error = None
+        addresses = socket.getaddrinfo(
+            self.host, self.port, socket.AF_INET, socket.SOCK_STREAM
+        )
+        for family, socktype, proto, _canonname, sockaddr in addresses:
+            sock = socket.socket(family, socktype, proto)
+            try:
+                if timeout is not None:
+                    sock.settimeout(timeout)
+                sock.connect(sockaddr)
+                self.sock = sock
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(
+                    self.sock, server_hostname=self.host
+                )
+                return
+            except OSError as exc:
+                last_error = exc
+                sock.close()
+
+        if last_error is not None:
+            raise last_error
+        raise OSError("No IPv4 address available for Overpass host")
+
+
+class IPv4HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(IPv4HTTPSConnection, req, context=ssl.create_default_context())
+
+
+IPV4_OPENER = urllib.request.build_opener(IPv4HTTPSHandler)
 
 app = Flask(__name__, static_folder=FRONTEND, static_url_path="")
 
@@ -67,14 +121,32 @@ out body;
 >;
 out skel qt;"""
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    req = urllib.request.Request(
-        OVERPASS_URL,
-        data=encoded,
-        headers={"User-Agent": "DehradunTrafficPBL/2.0 (educational project)"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=120) as response:
-        data = json.load(response)
+    headers = {
+        "User-Agent": "DehradunTrafficPBL/2.1 (educational project)",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "application/json",
+    }
+
+    errors = []
+    data = None
+    for endpoint in OVERPASS_URLS:
+        req = urllib.request.Request(
+            endpoint,
+            data=encoded,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with IPV4_OPENER.open(req, timeout=120) as response:
+                data = json.load(response)
+            break
+        except Exception as exc:
+            errors.append(f"{endpoint}: {exc}")
+
+    if data is None:
+        raise RuntimeError(
+            "All Overpass API endpoints failed. " + " | ".join(errors)
+        )
 
     nodes = {}
     ways = []
