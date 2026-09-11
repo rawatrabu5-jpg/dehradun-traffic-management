@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Smart Intelligent Dehradun Traffic Management</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Inter,Arial,sans-serif;background:#eef2f5;color:#17212b}
+    .app{max-width:1450px;margin:auto;min-height:100vh;display:grid;grid-template-columns:380px 1fr}
+    .panel{background:#fff;padding:22px;border-right:1px solid #d9e0e6;overflow:auto;z-index:1000}
+    h1{font-size:21px;margin:0 0 5px}.sub{font-size:13px;color:#66737f;margin-bottom:16px}
+    .hint{background:#f3f7fa;border:1px solid #dce5eb;border-radius:10px;padding:10px;font-size:12px;line-height:1.45;margin-bottom:14px}
+    label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px;color:#42505c}
+    .point{padding:10px;border:1px solid #d5dde3;border-radius:10px;font-size:13px;background:#fafcfd;margin-bottom:8px}
+    .point b{display:block;margin-bottom:3px}.coords{color:#66737f;font-size:11px}
+    button{width:100%;height:42px;border:1px solid #1769aa;border-radius:10px;background:#1769aa;color:#fff;padding:0 12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px}
+    button.secondary{background:#f4f7f9;color:#24313c;border-color:#d5dde3}
+    .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:16px}.stat{background:#f5f8fa;border:1px solid #e0e6ea;border-radius:12px;padding:12px;font-size:12px}.stat b{display:block;font-size:16px;margin-top:3px}
+    .route{margin-top:16px;border-top:1px solid #e3e8ec;padding-top:14px}.route-item{padding:6px 0;border-bottom:1px dashed #e1e5e8;font-size:11px}
+    .msg{font-size:12px;color:#a33;margin-top:10px;min-height:16px}.ok{color:#1769aa}.source-dot{color:#16883e}.dest-dot{color:#b43b3b}
+    #map{min-height:100vh}.legend{position:absolute;z-index:900;right:20px;bottom:20px;background:#fff;padding:12px 14px;border-radius:10px;box-shadow:0 2px 12px #0002;font-size:12px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.trafficbox{margin-top:16px;border-top:1px solid #e3e8ec;padding-top:14px}
+    .trafficbox input{width:100%;padding:9px;border:1px solid #ccd6dd;border-radius:8px}.small{font-size:11px;color:#66737f;line-height:1.4}
+    @media(max-width:850px){.app{grid-template-columns:1fr}.panel{border-right:0}.map-wrap{height:60vh}#map{min-height:60vh}}
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="panel">
+    <h1>Smart Intelligent Dehradun Traffic</h1>
+    <div class="sub">Real OpenStreetMap road network • C++ Dijkstra • Leaflet</div>
+    <div class="hint"><b>No predefined locations.</b><br>Click the map to choose your source and destination. The backend downloads the real Dehradun road network from OpenStreetMap through the Overpass API and builds the graph automatically.</div>
+
+    <div class="point"><b><span class="source-dot">●</span> Source</b><span id="sourceText" class="coords">Not selected — click “Set Source”, then click the map.</span></div>
+    <div class="point"><b><span class="dest-dot">●</span> Destination</b><span id="destText" class="coords">Not selected — click “Set Destination”, then click the map.</span></div>
+
+    <button id="setSource">Set Source on Map</button>
+    <button id="setDestination">Set Destination on Map</button>
+    <button id="find">Find Optimal Route</button>
+    <button id="refresh" class="secondary">Refresh Road Network API</button>
+    <div id="msg" class="msg"></div>
+
+    <div class="stats">
+      <div class="stat">Route cost<b id="cost">—</b></div>
+      <div class="stat">Distance<b id="distance">—</b></div>
+      <div class="stat">Travel time<b id="time">—</b></div>
+      <div class="stat">Graph size<b id="nodes">—</b></div>
+    </div>
+
+    <div class="route"><b>Optimal path</b><div id="path" class="small">Select two points and calculate a route.</div></div>
+
+    <div class="trafficbox">
+      <b>Traffic simulation</b>
+      <p class="small">The road graph is now API-generated. Live traffic is not supplied by OpenStreetMap/Overpass; this control is reserved for future traffic-data integration.</p>
+      <input id="trafficNote" value="API road network active" disabled>
+    </div>
+    <p class="small" style="margin-top:16px">Map data © OpenStreetMap contributors. Road network: Overpass API. Route optimization: your C++ Dijkstra implementation.</p>
+  </aside>
+
+  <div class="map-wrap" style="position:relative">
+    <div id="map"></div>
+    <div class="legend">
+      <div><span class="dot" style="background:#1769aa"></span>Optimal route</div>
+      <div><span class="dot" style="background:#16883e"></span>Source</div>
+      <div><span class="dot" style="background:#b43b3b"></span>Destination</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const state={source:null,destination:null,mode:null,sourceMarker:null,destMarker:null,routeLayer:null};
+const $=id=>document.getElementById(id);
+const map=L.map('map').setView([30.338,78.055],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
+
+function fmt(p){return `${p[0].toFixed(6)}, ${p[1].toFixed(6)}`;}
+function setMarker(kind,p){
+  if(kind==='source'){
+    if(state.sourceMarker)state.sourceMarker.remove();
+    state.sourceMarker=L.marker(p).addTo(map).bindPopup('Source').openPopup();
+    $('sourceText').textContent=fmt(p);
+  }else{
+    if(state.destMarker)state.destMarker.remove();
+    state.destMarker=L.marker(p).addTo(map).bindPopup('Destination').openPopup();
+    $('destText').textContent=fmt(p);
+  }
+}
+
+map.on('click',e=>{
+  if(!state.mode)return;
+  const p=[e.latlng.lat,e.latlng.lng];
+  if(state.mode==='source'){state.source=p;setMarker('source',p);$('msg').textContent='Source selected. Now set destination or calculate the route.';}
+  else {state.destination=p;setMarker('destination',p);$('msg').textContent='Destination selected. Click Find Optimal Route.';}
+  state.mode=null;map.getContainer().style.cursor='';
+});
+
+$('setSource').onclick=()=>{state.mode='source';map.getContainer().style.cursor='crosshair';$('msg').textContent='Click the map to select the source.';};
+$('setDestination').onclick=()=>{state.mode='destination';map.getContainer().style.cursor='crosshair';$('msg').textContent='Click the map to select the destination.';};
+
+async function loadNetwork(){
+  $('msg').textContent='Downloading/checking the real Dehradun road network…';
+  const r=await fetch('/api/network');const d=await r.json();
+  if(!r.ok)throw new Error(d.error||'Road network unavailable');
+  $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
+  $('msg').textContent=`API road graph ready: ${d.nodeCount.toLocaleString()} nodes and ${d.edgeCount.toLocaleString()} edges.`;
+}
+
+async function findRoute(){
+  $('msg').textContent='';
+  if(!state.source||!state.destination){$('msg').textContent='Select both source and destination on the map.';return;}
+  const r=await fetch('/api/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:state.source,destination:state.destination})});
+  const d=await r.json();
+  if(!r.ok){$('msg').textContent=d.error||'Unable to calculate route.';return;}
+  if(state.routeLayer)state.routeLayer.remove();
+  if(!d.found){$('path').textContent='No route found in the generated road graph.';return;}
+  state.routeLayer=L.polyline(d.geometry,{color:'#1769aa',weight:7,opacity:.95}).addTo(map);
+  state.routeLayer.bindTooltip('C++ Dijkstra optimal route');
+  map.fitBounds(state.routeLayer.getBounds(),{padding:[40,40]});
+  $('path').innerHTML=d.path.map((id,i)=>`<div class="route-item"><b>${i+1}.</b> Road node ${id}</div>`).join('');
+  $('cost').textContent=d.cost.toFixed(2);
+  $('distance').textContent=d.distanceKm.toFixed(2)+' km';
+  $('time').textContent=d.timeMin.toFixed(1)+' min';
+  $('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;
+  $('msg').textContent=`Route calculated. Source snapped ${d.sourceSnapMeters} m to the road network; destination snapped ${d.destinationSnapMeters} m.`;
+}
+
+$('find').onclick=()=>findRoute().catch(e=>$('msg').textContent=e.message);
+$('refresh').onclick=async()=>{
+  $('msg').textContent='Refreshing road data from Overpass…';
+  try{const r=await fetch('/api/refresh-network',{method:'POST'});const d=await r.json();if(!r.ok)throw new Error(d.error);$('nodes').textContent=`${d.nodeCount.toLocaleString()} nodes / ${d.edgeCount.toLocaleString()} edges`;$('msg').textContent='Road network refreshed successfully.';}catch(e){$('msg').textContent=e.message;}
+};
+loadNetwork().catch(e=>$('msg').textContent=e.message);
+</script>
+</body>
+</html>
