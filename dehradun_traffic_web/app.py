@@ -16,7 +16,10 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
 ENGINE = os.path.join(ROOT, "backend", "route_engine.exe" if os.name == "nt" else "route_engine")
 CACHE_FILE = os.path.join(ROOT, "backend", "dehradun_osm_graph.json")
-CACHE_TTL = 60 * 60 * 24 * 7  # road layout barely changes; refresh weekly at most.
+# NOTE: the committed road graph is used FOREVER for routing. It used to expire
+# after 7 days, which forced a live Overpass download (blocked/overloaded from
+# Render) and broke routing. Roads barely change; use "Refresh Road Network API"
+# or re-run prebake_graph.py on your own PC if you ever want new data.
 # The graph is normally pre-baked into CACHE_FILE at build time (see
 # prebake_graph.py) so a live request should almost never need to hit
 # Overpass at all. These knobs only matter for the rare cold-cache case,
@@ -239,8 +242,14 @@ def fetch_osm_graph(bbox=None):
     graph = {"generatedAt": time.time(), "bbox": list(bbox), "nodes": graph_nodes, "edges": graph_edges,
              "source": "OpenStreetMap road data via Overpass API (route-sized dynamic graph)"}
     if len(graph_nodes) < 100 or len(graph_edges) < 100: raise RuntimeError("The road-network API returned too little road data.")
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump(graph, f, separators=(",", ":"))
+    # Only the FULL-area graph is allowed to replace the master cache file.
+    # (A small route-sized download must never overwrite it.)
+    if tuple(bbox) == tuple(BBOX):
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(graph, f, separators=(",", ":"))
+        os.replace(tmp, CACHE_FILE)
+        _MEM["graph"], _MEM["mtime"] = graph, os.path.getmtime(CACHE_FILE)
     return graph
 
 
@@ -258,26 +267,60 @@ def route_bbox(source, destination):
             min(BBOX[2], max_lat+lat_pad), min(BBOX[3], max_lon+lon_pad))
 
 
+_MEM = {"graph": None, "mtime": None}
+_CPP = {"graph_id": None}
+
+
+def read_cached_graph():
+    """Return the cached graph (kept in memory; re-read only if the file changes). None if missing."""
+    if not os.path.exists(CACHE_FILE):
+        return None
+    mtime = os.path.getmtime(CACHE_FILE)
+    if _MEM["graph"] is not None and _MEM["mtime"] == mtime:
+        return _MEM["graph"]
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            graph = json.load(f)
+        if len(graph.get("nodes", [])) < 100:
+            return None
+        _MEM["graph"], _MEM["mtime"] = graph, mtime
+        return graph
+    except Exception:
+        return None
+
+
 def load_graph(force=False, points=None):
-    if not force and os.path.exists(CACHE_FILE):
-        try:
-            if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f: graph = json.load(f)
-                if not points or graph_covers_points(graph, points): return graph
-        except Exception: pass
-    bbox = route_bbox(points[0], points[1]) if points and len(points) == 2 else BBOX
+    """Use the saved road graph whenever it exists (regardless of age).
+
+    Only tries the live Overpass download when there is no usable cache, or
+    when force=True (the Refresh button). If a forced refresh fails, the old
+    cache stays in place and routing keeps working.
+    """
+    if not force:
+        graph = read_cached_graph()
+        if graph and (not points or graph_covers_points(graph, points)):
+            return graph
+    bbox = BBOX if (force or not points) else route_bbox(points[0], points[1])
     return fetch_osm_graph(bbox)
 
 def write_cpp_graph(graph):
-    """Write a compact text representation consumed by the C++ Dijkstra engine."""
+    """Write a compact text representation consumed by the C++ Dijkstra engine.
+
+    The file is only rewritten when the graph object changes (not on every request).
+    """
     path = os.path.join(ROOT, "backend", "graph_input.txt")
-    with open(path, "w", encoding="utf-8") as f:
+    if _CPP["graph_id"] == id(graph) and os.path.exists(path):
+        return path
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(f"{len(graph['nodes'])}\n")
         for i, (lat, lon) in enumerate(graph["nodes"]):
             f.write(f"{i} {lat:.7f} {lon:.7f}\n")
         f.write(f"{len(graph['edges'])}\n")
         for u, v, d, t, one_way in graph["edges"]:
             f.write(f"{u} {v} {d:.6f} {t:.6f} {int(one_way)}\n")
+    os.replace(tmp, path)
+    _CPP["graph_id"] = id(graph)
     return path
 
 
@@ -372,7 +415,7 @@ def network():
         })
     return jsonify({
         "ready": True,
-        "message": "Road network cache is available. It will be used when you calculate a route.",
+        "message": "Saved road network is ready. Routes are calculated from it (no live download needed).",
         "source": "OpenStreetMap road data via Overpass API"
     })
 
@@ -382,6 +425,14 @@ def refresh_network():
         graph = load_graph(force=True)
         return jsonify({"ok": True, "nodeCount": len(graph["nodes"]), "edgeCount": len(graph["edges"])})
     except Exception as e:
+        # Public Overpass servers often reject cloud hosts. Keep using the saved graph.
+        cached = read_cached_graph()
+        if cached:
+            return jsonify({
+                "ok": True, "kept": True,
+                "nodeCount": len(cached["nodes"]), "edgeCount": len(cached["edges"]),
+                "message": "Live refresh failed (OpenStreetMap servers are busy), so the saved road network is still being used. Routing works normally."
+            })
         return jsonify({"error": str(e)}), 503
 
 
@@ -398,6 +449,10 @@ def route():
             return jsonify({"error": "Choose source and destination points on the map."}), 400
         source_point = [float(source[0]), float(source[1])]
         dest_point = [float(destination[0]), float(destination[1])]
+
+        for lat, lon in (source_point, dest_point):
+            if not (BBOX[0] <= lat <= BBOX[2] and BBOX[1] <= lon <= BBOX[3]):
+                return jsonify({"error": "Selected point is outside the supported Dehradun area."}), 400
 
         graph = load_graph(points=[source_point, dest_point])
         graph_file = write_cpp_graph(graph)
